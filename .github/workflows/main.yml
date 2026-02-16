@@ -1,0 +1,147 @@
+name: Main
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+      - run: cargo clippy --all-targets -- -D warnings
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+      - run: cargo test
+
+  check-bump:
+    name: Check version bump
+    needs: [fmt, clippy, test]
+    runs-on: ubuntu-latest
+    outputs:
+      bump_needed: ${{ steps.check.outputs.bump_needed }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/setup
+      - id: check
+        run: |
+          if cog bump --auto --dry-run 2>/dev/null; then
+            echo "bump_needed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "bump_needed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  bump:
+    name: Bump version
+    needs: check-bump
+    if: needs.check-bump.outputs.bump_needed == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.bump.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/setup
+      - id: bump
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          cog bump --auto
+          VERSION=$(cog get-version)
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+      - run: |
+          VERSION=$(cog get-version)
+          git push origin main
+          git push origin "v${VERSION}"
+
+  build-binaries:
+    name: Build (${{ matrix.target }})
+    needs: bump
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: v${{ needs.bump.outputs.version }}
+      - uses: ./.github/actions/setup
+      - run: rustup target add ${{ matrix.target }}
+      - run: cargo build --release --target ${{ matrix.target }}
+      - name: Codesign binary (macOS)
+        if: runner.os == 'macOS'
+        run: codesign --sign - --force --options runtime target/${{ matrix.target }}/release/celsp
+      - name: Package binary
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar czf celsp-${{ matrix.target }}.tar.gz celsp
+          shasum -a 256 celsp-${{ matrix.target }}.tar.gz > celsp-${{ matrix.target }}.tar.gz.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: celsp-${{ matrix.target }}
+          path: |
+            target/${{ matrix.target }}/release/celsp-${{ matrix.target }}.tar.gz
+            target/${{ matrix.target }}/release/celsp-${{ matrix.target }}.tar.gz.sha256
+
+  release:
+    name: GitHub Release
+    needs: [bump, build-binaries]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: v${{ needs.bump.outputs.version }}
+          fetch-depth: 0
+      - uses: ./.github/actions/setup
+      - name: Generate changelog
+        id: changelog
+        run: |
+          {
+            echo 'body<<EOF'
+            cog changelog --at v${{ needs.bump.outputs.version }}
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Collect release assets
+        run: |
+          mkdir release
+          cp artifacts/celsp-*/celsp-*.tar.gz release/
+          cd release
+          cat ../artifacts/celsp-*/celsp-*.sha256 > checksums.txt
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.bump.outputs.version }}
+          body: ${{ steps.changelog.outputs.body }}
+          files: release/*
